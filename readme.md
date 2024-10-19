@@ -2,6 +2,8 @@
 
 This repository contains a Python-based network device discovery tool that uses ARP scanning to identify devices on your local network.
 
+**for more scripts related cyber and securiy check here: [Cyber Security Scripts section](https://github.com/YanivHaliwa/Linux-Stuff/blob/master/README.md#cyber-security-scripts).**
+
 ## Scripts
 
 - **device_f**: A bash script that runs the main Python script with sudo privileges.
