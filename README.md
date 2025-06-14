@@ -26,17 +26,11 @@ the script:
 
 ### Installation
 
-you can clone ONLY this folder if you run this command: 
+Clone the repository using the following command:
 
 ```bash
-git clone --filter=blob:none --no-checkout https://github.com/YanivHaliwa/Cyber-Stuff.git && cd Cyber-Stuff && git sparse-checkout init --cone && git sparse-checkout set devices_finder  && git checkout
-```
-
-OR you can Clone the repository using the following command:
-
-```bash
-git clone  https://github.com/YanivHaliwa/Cyber-Stuff.git
-cd cd Cyber-Stuff/devices_finder
+git clone  https://github.com/YanivHaliwa/devices_finder.git
+cd devices_finder
 ```
 
 ## Usage
