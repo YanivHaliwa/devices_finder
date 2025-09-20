@@ -1,0 +1,171 @@
+#!/bin/bash
+#version 20.9.25
+# Lists devices on the local LAN using arp-scan
+# Requirements: arp-scan (sudo/root needed), iproute2
+
+set -euo pipefail
+
+# Defaults
+IFACE=""
+USE_SUDO=true
+ME_IPS=()
+
+# Fallback: look up vendor in Yaniv's local MAC database only when arp-scan returns Unknown
+check_mac_vendor() {
+  local mac_prefix="$1"  # format: AA-BB-CC uppercase with dashes
+  local vendor
+  # Match the dashed OUI line that has "(hex)" and extract the vendor text following it
+  vendor=$(grep -i "^${mac_prefix}[[:space:]]*(hex)" \
+           "$(dirname "$0")/macs.txt" 2>/dev/null \
+           | head -n 1 \
+           | sed -n 's/.*(hex)[[:space:]]*\(.*\)/\1/p' \
+           | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  if [ -n "$vendor" ]; then
+    printf '%s' "$vendor"
+    return 0
+  fi
+  return 1
+}
+
+print_usage() {
+  cat <<'EOF'
+Usage: devices [-I IFACE]
+
+Lists devices on the local LAN using arp-scan with helpful labels.
+
+Options:
+  -I, --interface IFACE   Interface to use (e.g., wlan0, eth0)
+  -h, --help              Show this help
+
+Examples:
+  devices
+  devices -I wlan0
+EOF
+}
+
+# Arg parsing
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -I|--interface)
+      IFACE=${2:-}; shift 2 ;;
+    -h|--help)
+      print_usage; exit 0 ;;
+    *)
+      echo "Unknown option: $1" >&2; print_usage; exit 1 ;;
+  esac
+
+done
+
+# Auto-detect interface and local/gateway IPs
+if [ -z "$IFACE" ]; then
+  IFACE=$(ip -o -4 route show to default | awk 'NR==1{print $5}')
+fi
+if [ -z "$IFACE" ]; then
+  echo "Unable to detect default interface. Use -I IFACE." >&2
+  exit 2
+fi
+
+LOCAL_IP=$(ip -o -4 route get 1.1.1.1 2>/dev/null | awk 'NR==1{print $7}')
+if [ -z "$LOCAL_IP" ]; then
+  LOCAL_IP=$(ip -o -4 addr show dev "$IFACE" | awk '{print $4}' | cut -d/ -f1 | head -n1)
+fi
+GATEWAY_IP=$(ip route | awk '/^default/ {print $3; exit}')
+LOCAL_MAC=$(cat "/sys/class/net/$IFACE/address" 2>/dev/null || true)
+
+# If no explicit --me, mark the local IP automatically
+if [ ${#ME_IPS[@]} -eq 0 ] && [ -n "$LOCAL_IP" ]; then
+  ME_IPS+=("$LOCAL_IP")
+fi
+
+# Build arp-scan command
+SCAN_CMD=(arp-scan --localnet --ignoredups --plain)
+if [ -n "$IFACE" ]; then
+  SCAN_CMD+=( -I "$IFACE" )
+fi
+
+# Prefer sudo if not root
+if $USE_SUDO && [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  SCAN_CMD=(sudo "${SCAN_CMD[@]}")
+fi
+
+# Execute scan
+SCAN_OUTPUT=$("${SCAN_CMD[@]}" 2>/dev/null || true)
+
+# Header
+printf "%-15s %-17s %s\n" "IP Address" "MAC Address" "Vendor/Notes"
+printf "%-15s %-17s %s\n" "---------------" "-----------------" "-----------------------------"
+
+# Track whether we saw any of the ME_IPS
+declare -A SEEN_ME
+for ip in "${ME_IPS[@]}"; do SEEN_ME["$ip"]=0; done
+
+# Process arp-scan lines: "IP\tMAC\tVendor..."
+# Note: --plain ensures only results lines, but be paranoid and filter
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  # Expect three columns minimum
+  ip=$(printf '%s' "$line" | awk '{print $1}')
+  mac=$(printf '%s' "$line" | awk '{print $2}')
+  vendor=$(printf '%s' "$line" | cut -f3- -d$'\t' | sed 's/^ *//')
+  # Some arp-scan builds separate by spaces; fallback if vendor empty
+  if [ -z "$vendor" ]; then
+    vendor=$(printf '%s' "$line" | cut -d' ' -f3-)
+  fi
+  # If vendor is unknown, try local OUI database as a strict fallback
+  vtmp=$(printf '%s' "$vendor" | tr '[:upper:]' '[:lower:]')
+  if [ -z "$vendor" ] || [[ "$vtmp" == *unknown* ]]; then
+    MAC_PREFIX=$(printf '%s' "$mac" | awk -F: '{print toupper($1 "-" $2 "-" $3)}')
+    if VENDOR_F=$(check_mac_vendor "$MAC_PREFIX"); then
+      vendor="$VENDOR_F"
+    fi
+  fi
+  # Skip if ip/mac doesn't look right
+  [[ "$ip" != *.*.*.* ]] && continue
+  [[ "$mac" != *:*:*:*:*:* ]] && continue
+
+  notes=( )
+  # VM detection by known OUIs (append VM)
+  MAC_UPPER=$(printf "%s" "$mac" | tr "[:lower:]" "[:upper:]")
+  case $MAC_UPPER in
+    08:00:27:*) notes+=("VM") ;;
+    00:15:5D:*) notes+=("VM") ;;
+    52:54:00:*) notes+=("VM") ;;
+    00:1C:14:*|00:50:56:*|00:0C:29:*) notes+=("VM") ;;
+  esac
+
+  # Router labeling: gateway IP or Huawei vendor
+  vlow=$(printf '%s' "$vendor" | tr '[:upper:]' '[:lower:]')
+  if [ -n "$GATEWAY_IP" ] && [ "$ip" = "$GATEWAY_IP" ]; then
+    notes+=("Router")
+  elif [[ "$vlow" == *huawei* ]]; then
+    notes+=("Router")
+  fi
+  # This Computer labeling
+  for me in "${ME_IPS[@]}"; do
+    if [ "$ip" = "$me" ]; then
+      notes+=("This Computer")
+      SEEN_ME["$me"]=1
+      break
+    fi
+  done
+
+  # Compose Vendor/Notes
+  label="$vendor"
+  if [ ${#notes[@]} -gt 0 ]; then
+    notes_str="${notes[0]}"
+    if [ ${#notes[@]} -gt 1 ]; then
+      for ((i=1;i<${#notes[@]};i++)); do
+        notes_str+="; ${notes[$i]}"
+      done
+    fi
+    label="$vendor ($notes_str)"
+  fi
+  printf "%-15s %-17s %s\n" "$ip" "$mac" "$label"
+done <<< "$SCAN_OUTPUT"
+
+# If our host IP(s) didn't appear in the scan (common), add them manually
+for me in "${ME_IPS[@]}"; do
+  if [ "${SEEN_ME[$me]}" -eq 0 ] 2>/dev/null; then
+    printf "%-15s %-17s %s\n" "$me" "${LOCAL_MAC:-unknown}" "This Computer"
+  fi
+done
